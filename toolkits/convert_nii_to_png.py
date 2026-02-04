@@ -155,6 +155,8 @@ def convert_nii_to_png(
     window_center: int = -600,
     window_width: int = 1500,
     empty_slice_ratio: float = 0.1,
+    tumor_only: bool = False,
+    min_tumor_pixels: int = 0,
     seed: int = 42
 ) -> dict:
     """
@@ -166,6 +168,8 @@ def convert_nii_to_png(
         window_center: CT 窗位
         window_width: CT 窗宽
         empty_slice_ratio: 保留的空白切片比例 (0-1)
+        tumor_only: 如果为 True，只保存有肿瘤的切片
+        min_tumor_pixels: 最小肿瘤像素数（过滤太小的标注）
         seed: 随机种子（用于选择空白切片）
 
     Returns:
@@ -190,17 +194,30 @@ def convert_nii_to_png(
     if len(nii_pairs) == 0:
         raise FileNotFoundError(f"在 {src_path} 中没有找到有效的 NIfTI 文件对")
 
+    # 如果 tumor_only 为 True，强制设置 empty_slice_ratio 为 0
+    if tumor_only:
+        empty_slice_ratio = 0.0
+        print("模式: 仅保存含肿瘤的切片")
+    else:
+        print(f"模式: 保留 {empty_slice_ratio*100:.0f}% 的空白切片")
+
+    if min_tumor_pixels > 0:
+        print(f"过滤: 肿瘤像素数 < {min_tumor_pixels} 的切片将被视为空白")
+
     # 统计信息
     stats = {
         "total_volumes": len(nii_pairs),
         "total_slices": 0,
         "saved_slices": 0,
         "slices_with_tumor": 0,
+        "slices_filtered_small_tumor": 0,
         "empty_slices_saved": 0,
         "empty_slices_skipped": 0,
         "window_center": window_center,
         "window_width": window_width,
         "empty_slice_ratio": empty_slice_ratio,
+        "tumor_only": tumor_only,
+        "min_tumor_pixels": min_tumor_pixels,
         "files": []
     }
 
@@ -224,11 +241,18 @@ def convert_nii_to_png(
             img_slice = img_data[:, :, slice_idx]
             label_slice = label_data[:, :, slice_idx]
 
-            has_tumor = np.any(label_slice > 0)
+            # 计算肿瘤像素数
+            tumor_pixels = np.sum(label_slice > 0)
+            has_valid_tumor = tumor_pixels >= min_tumor_pixels and tumor_pixels > 0
 
-            if has_tumor:
-                # 有肿瘤的切片全部保留
+            if has_valid_tumor:
+                # 有效肿瘤切片全部保留
                 stats["slices_with_tumor"] += 1
+            elif tumor_pixels > 0:
+                # 有肿瘤但太小，被过滤
+                stats["slices_filtered_small_tumor"] += 1
+                empty_slice_indices.append(slice_idx)
+                continue
             else:
                 # 空白切片先收集，后续随机选择
                 empty_slice_indices.append(slice_idx)
@@ -281,6 +305,8 @@ def convert_nii_to_png(
     print(f"保存的切片数:    {stats['saved_slices']}")
     print(f"  - 含肿瘤切片:  {stats['slices_with_tumor']}")
     print(f"  - 空白切片:    {stats['empty_slices_saved']}")
+    if stats['slices_filtered_small_tumor'] > 0:
+        print(f"过滤的小肿瘤:   {stats['slices_filtered_small_tumor']}")
     print(f"跳过的空白切片:  {stats['empty_slices_skipped']}")
     print(f"输出目录:        {dst_path}")
     print("=" * 50)
@@ -325,6 +351,13 @@ def main():
 示例:
   # 基本用法
   python convert_nii_to_png.py --input ./data/raw --output ./data/png
+
+  # 只导出有肿瘤的切片（推荐用于训练）
+  python convert_nii_to_png.py --input ./data/raw --output ./data/png --tumor-only
+
+  # 过滤太小的肿瘤标注（至少100个像素）
+  python convert_nii_to_png.py --input ./data/raw --output ./data/png \\
+      --tumor-only --min-tumor-pixels 100
 
   # 自定义窗宽窗位（纵隔窗）
   python convert_nii_to_png.py --input ./data/raw --output ./data/png \\
@@ -372,6 +405,17 @@ CT 窗宽窗位参考:
         help="保留的空白切片比例 (默认: 0.1，即保留 10%%)"
     )
     parser.add_argument(
+        "--tumor-only", "-t",
+        action="store_true",
+        help="只保存含肿瘤的切片 (等同于 --empty-ratio 0)"
+    )
+    parser.add_argument(
+        "--min-tumor-pixels", "-m",
+        type=int,
+        default=0,
+        help="最小肿瘤像素数，小于此值的切片被视为空白 (默认: 0，不过滤)"
+    )
+    parser.add_argument(
         "--seed", "-s",
         type=int,
         default=42,
@@ -399,6 +443,8 @@ CT 窗宽窗位参考:
         window_center=args.window_center,
         window_width=args.window_width,
         empty_slice_ratio=args.empty_ratio,
+        tumor_only=args.tumor_only,
+        min_tumor_pixels=args.min_tumor_pixels,
         seed=args.seed
     )
 

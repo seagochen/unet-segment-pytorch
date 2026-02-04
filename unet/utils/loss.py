@@ -27,12 +27,19 @@ class DiceLoss(nn.Module):
     Args:
         smooth: Smoothing factor to avoid division by zero
         reduction: 'mean', 'sum', or 'none'
+        ignore_background: If True, only compute Dice for foreground classes
     """
 
-    def __init__(self, smooth: float = 1.0, reduction: str = 'mean'):
+    def __init__(
+        self,
+        smooth: float = 1.0,
+        reduction: str = 'mean',
+        ignore_background: bool = True
+    ):
         super().__init__()
         self.smooth = smooth
         self.reduction = reduction
+        self.ignore_background = ignore_background
 
     def forward(
         self,
@@ -63,6 +70,10 @@ class DiceLoss(nn.Module):
         union = predictions.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3))
 
         dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+
+        # Ignore background class (class 0) if specified
+        if self.ignore_background and num_classes > 1:
+            dice = dice[:, 1:]  # Only foreground classes
 
         # Average over classes and batch
         if self.reduction == 'mean':
@@ -163,6 +174,7 @@ class CombinedLoss(nn.Module):
         dice_weight: Weight for Dice loss
         class_weights: Optional class weights for CrossEntropy
         smooth: Smoothing factor for Dice loss
+        ignore_background: If True, Dice loss ignores background class
     """
 
     def __init__(
@@ -170,7 +182,8 @@ class CombinedLoss(nn.Module):
         ce_weight: float = 1.0,
         dice_weight: float = 1.0,
         class_weights: Optional[List[float]] = None,
-        smooth: float = 1.0
+        smooth: float = 1.0,
+        ignore_background: bool = True
     ):
         super().__init__()
         self.ce_weight = ce_weight
@@ -184,7 +197,7 @@ class CombinedLoss(nn.Module):
         else:
             self.ce_loss = nn.CrossEntropyLoss()
 
-        self.dice_loss = DiceLoss(smooth=smooth)
+        self.dice_loss = DiceLoss(smooth=smooth, ignore_background=ignore_background)
 
     def forward(
         self,
@@ -211,22 +224,103 @@ class CombinedLoss(nn.Module):
         return self.ce_weight * ce + self.dice_weight * dice
 
 
+class FocalTverskyLoss(nn.Module):
+    """
+    Focal Tversky Loss for highly imbalanced segmentation.
+
+    Tversky index is a generalization of Dice that allows controlling
+    the trade-off between false positives and false negatives.
+
+    TI = TP / (TP + alpha*FN + beta*FP)
+    Focal Tversky Loss = (1 - TI)^gamma
+
+    When alpha > beta, false negatives are penalized more heavily,
+    which helps detect small objects.
+
+    Args:
+        alpha: Weight for false negatives (default: 0.7)
+        beta: Weight for false positives (default: 0.3)
+        gamma: Focal parameter to focus on hard examples (default: 0.75)
+        smooth: Smoothing factor
+
+    Reference:
+        Abraham & Khan, "A Novel Focal Tversky loss function with improved
+        Attention U-Net for lesion segmentation"
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.7,
+        beta: float = 0.3,
+        gamma: float = 0.75,
+        smooth: float = 1.0,
+    ):
+        super().__init__()
+        self.alpha = alpha  # Weight for FN
+        self.beta = beta    # Weight for FP
+        self.gamma = gamma  # Focal parameter
+        self.smooth = smooth
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute Focal Tversky Loss for foreground class only.
+
+        Args:
+            predictions: Model output logits (N, C, H, W)
+            targets: Ground truth labels (N, H, W)
+
+        Returns:
+            Focal Tversky loss value
+        """
+        # Get probabilities for tumor class (class 1)
+        probs = F.softmax(predictions, dim=1)
+        tumor_probs = probs[:, 1]  # (N, H, W)
+
+        # Get tumor targets
+        tumor_targets = (targets == 1).float()  # (N, H, W)
+
+        # Flatten (use reshape instead of view for non-contiguous tensors)
+        tumor_probs_flat = tumor_probs.reshape(-1)
+        tumor_targets_flat = tumor_targets.reshape(-1)
+
+        # True positives, false negatives, false positives
+        tp = (tumor_probs_flat * tumor_targets_flat).sum()
+        fn = ((1 - tumor_probs_flat) * tumor_targets_flat).sum()
+        fp = (tumor_probs_flat * (1 - tumor_targets_flat)).sum()
+
+        # Tversky index
+        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+
+        # Focal Tversky loss
+        focal_tversky = (1 - tversky) ** self.gamma
+
+        return focal_tversky
+
+
 def create_loss_function(
     loss_type: str = 'combined',
     ce_weight: float = 1.0,
     dice_weight: float = 1.0,
     class_weights: Optional[List[float]] = None,
     focal_gamma: float = 2.0,
+    tversky_alpha: float = 0.7,
+    tversky_beta: float = 0.3,
 ) -> nn.Module:
     """
     Factory function to create loss function.
 
     Args:
-        loss_type: One of 'dice', 'ce', 'combined', 'focal'
+        loss_type: One of 'dice', 'ce', 'combined', 'focal', 'focal_tversky'
         ce_weight: Weight for CE in combined loss
         dice_weight: Weight for Dice in combined loss
         class_weights: Optional class weights
-        focal_gamma: Gamma for focal loss
+        focal_gamma: Gamma for focal loss / focal tversky loss
+        tversky_alpha: Alpha for Focal Tversky (weight for false negatives)
+        tversky_beta: Beta for Focal Tversky (weight for false positives)
 
     Returns:
         Loss function module
@@ -234,7 +328,7 @@ def create_loss_function(
     loss_type = loss_type.lower()
 
     if loss_type == 'dice':
-        return DiceLoss()
+        return DiceLoss(ignore_background=True)
     elif loss_type == 'ce' or loss_type == 'crossentropy':
         if class_weights is not None:
             weight = torch.tensor(class_weights, dtype=torch.float32)
@@ -248,5 +342,11 @@ def create_loss_function(
         )
     elif loss_type == 'focal':
         return FocalLoss(alpha=class_weights, gamma=focal_gamma)
+    elif loss_type == 'focal_tversky':
+        return FocalTverskyLoss(
+            alpha=tversky_alpha,
+            beta=tversky_beta,
+            gamma=focal_gamma
+        )
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")

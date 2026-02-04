@@ -266,6 +266,9 @@ def main():
         ce_weight=loss_config.get('ce_weight', 1.0),
         dice_weight=loss_config.get('dice_weight', 1.0),
         class_weights=loss_config.get('class_weights'),
+        focal_gamma=loss_config.get('focal_gamma', 0.75),
+        tversky_alpha=loss_config.get('tversky_alpha', 0.7),
+        tversky_beta=loss_config.get('tversky_beta', 0.3),
     )
 
     # Optimizer

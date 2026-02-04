@@ -212,3 +212,6 @@ lung_tumor_segmentation/
 
 # Training outputs
 runs/
+
+# Testing outputs
+test_predictions/

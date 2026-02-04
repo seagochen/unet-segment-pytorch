@@ -39,12 +39,12 @@ early_stopping:
 
 # Loss Function
 loss:
-  type: combined         # Options: dice, ce, combined, focal
-  ce_weight: 0.5         # Weight for CrossEntropy
-  dice_weight: 0.5       # Weight for Dice loss
-  class_weights:         # Higher weight for minority class (tumor)
-    - 1.0                # Background
-    - 5.0                # Tumor
+  type: focal_tversky    # Best for small objects (tumors)
+  # Focal Tversky penalizes false negatives more heavily (alpha > beta)
+  # This helps detect small tumors that might otherwise be missed
+  tversky_alpha: 0.7     # Weight for false negatives (higher = penalize missed tumors more)
+  tversky_beta: 0.3      # Weight for false positives
+  focal_gamma: 0.75      # Focus on hard examples
 
 # Data Augmentation
 augmentation:
