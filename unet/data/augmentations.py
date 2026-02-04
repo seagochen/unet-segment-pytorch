@@ -56,17 +56,33 @@ def get_train_transforms(
     return A.Compose([
         A.Resize(img_size, img_size),
         A.HorizontalFlip(p=p_flip),
-        A.Rotate(limit=rotation_limit, p=p_rotate, border_mode=0),
+        A.VerticalFlip(p=0.3),
+        A.ShiftScaleRotate(
+            shift_limit=0.1,
+            scale_limit=0.15,
+            rotate_limit=rotation_limit,
+            p=0.5,
+            border_mode=0,
+        ),
         A.ElasticTransform(
             alpha=50,
             sigma=10,
             p=p_elastic,
-            border_mode=0
+            border_mode=0,
         ),
+        A.GridDistortion(num_steps=5, distort_limit=0.2, p=0.3, border_mode=0),
         A.RandomBrightnessContrast(
-            brightness_limit=0.1,
-            contrast_limit=0.1,
-            p=p_brightness
+            brightness_limit=0.15,
+            contrast_limit=0.15,
+            p=p_brightness,
+        ),
+        A.GaussNoise(var_limit=(5, 25), p=0.2),
+        A.CoarseDropout(
+            max_holes=4,
+            max_height=img_size // 8,
+            max_width=img_size // 8,
+            fill_value=0,
+            p=0.2,
         ),
         A.Normalize(mean=[mean], std=[std]),
         ToTensorV2(),

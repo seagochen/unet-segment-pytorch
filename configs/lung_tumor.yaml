@@ -8,20 +8,21 @@ model:
   n_classes: 2           # Background + Tumor
   bilinear: true         # Use bilinear upsampling (vs transposed conv)
   base_features: 64      # Base number of features
+  deep_supervision: true # Compute loss at multiple decoder scales
 
 # Data Configuration
 data:
   root: ./dataset
-  img_size: 256
+  img_size: 512          # Higher resolution for small tumor detection (was 256)
   val_ratio: 0.2         # 20% for validation
-  batch_size: 8
+  batch_size: 4          # Reduced for 512 input (was 8)
   num_workers: 4
 
 # Training Configuration
 train:
   epochs: 150
   lr: 0.00005            # Very low constant learning rate
-  weight_decay: 0.0001   # L2 regularization
+  weight_decay: 0.001    # Stronger L2 regularization
   grad_clip: 1.0         # Gradient clipping (0 to disable)
 
 # Learning Rate Scheduler
@@ -34,20 +35,19 @@ scheduler:
 # EMA (Exponential Moving Average) - Stabilizes training
 ema:
   enabled: true            # Use EMA for validation and saving
-  decay: 0.99              # Lower decay for faster adaptation (was 0.999)
+  decay: 0.99              # Lower decay for faster adaptation
   warmup_epochs: 10        # Use training model for first N epochs
 
 # Early Stopping
 early_stopping:
   enabled: true          # Re-enable early stopping
-  patience: 30           # Epochs to wait before stopping
+  patience: 25           # Slightly more patience for higher resolution
   monitor: class_dice.tumor  # Monitor TUMOR dice, not mean dice!
   mode: max              # 'max' for metrics, 'min' for loss
 
 # Loss Function
 loss:
   type: balanced_focal_tversky  # Balanced CE + Focal Tversky
-  # Balanced CE: each image weight=1, tumor pixels share 0.5, background shares 0.5
   balanced_class_weight: 0.5    # Weight for tumor class (0.5 = equal attention)
   ce_weight: 1.0                # Weight for balanced CE component
   dice_weight: 1.0              # Weight for Focal Tversky component
@@ -55,6 +55,8 @@ loss:
   tversky_alpha: 0.7            # Weight for false negatives
   tversky_beta: 0.3             # Weight for false positives
   focal_gamma: 0.75             # Focus on hard examples
+  # Deep supervision loss weights: [main, 1/2_res, 1/4_res, 1/8_res]
+  ds_weights: [1.0, 0.4, 0.2, 0.1]
 
 # Data Augmentation
 augmentation:
@@ -67,7 +69,7 @@ augmentation:
 # Output Configuration
 output:
   save_dir: ./runs
-  experiment_name: liver_tumor_balanced
+  experiment_name: lung_tumor_ds512
   save_last: true        # Save last checkpoint
   save_best: true        # Save best checkpoint
 

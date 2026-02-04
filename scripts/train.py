@@ -30,7 +30,7 @@ sys.path.insert(0, str(project_root))
 from unet.models import UNet, AttentionUNet
 from unet.data.dataset import LungTumorDataset
 from unet.data.augmentations import get_train_transforms, get_val_transforms
-from unet.utils.loss import create_loss_function
+from unet.utils.loss import create_loss_function, DeepSupervisionLoss
 from unet.utils.metrics import SegmentationMetrics
 from unet.utils.general import set_seed, get_device, load_config, increment_path, ModelEMA
 from unet.utils.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
@@ -281,6 +281,8 @@ def main():
     model_config = config['model']
     model_type = model_config.get('type', 'unet').lower()
 
+    deep_supervision = model_config.get('deep_supervision', False)
+
     model_kwargs = {
         'n_channels': model_config['n_channels'],
         'n_classes': model_config['n_classes'],
@@ -289,8 +291,8 @@ def main():
     }
 
     if model_type == 'attention_unet' or model_type == 'attention':
-        model = AttentionUNet(**model_kwargs).to(device)
-        print(f"Using Attention U-Net")
+        model = AttentionUNet(**model_kwargs, deep_supervision=deep_supervision).to(device)
+        print(f"Using Attention U-Net" + (" with Deep Supervision" if deep_supervision else ""))
     else:
         model = UNet(**model_kwargs).to(device)
         print(f"Using standard U-Net")
@@ -310,7 +312,7 @@ def main():
 
     # Loss function
     loss_config = config['loss']
-    criterion = create_loss_function(
+    base_criterion = create_loss_function(
         loss_type=loss_config['type'],
         ce_weight=loss_config.get('ce_weight', 1.0),
         dice_weight=loss_config.get('dice_weight', 1.0),
@@ -320,7 +322,15 @@ def main():
         tversky_beta=loss_config.get('tversky_beta', 0.3),
         balanced_class_weight=loss_config.get('balanced_class_weight', 0.5),
     )
-    print(f"Loss function: {loss_config['type']}")
+
+    # Wrap with deep supervision loss if enabled
+    if deep_supervision:
+        ds_weights = loss_config.get('ds_weights', [1.0, 0.4, 0.2, 0.1])
+        criterion = DeepSupervisionLoss(base_criterion, weights=ds_weights)
+        print(f"Loss function: {loss_config['type']} + Deep Supervision (weights={ds_weights})")
+    else:
+        criterion = base_criterion
+        print(f"Loss function: {loss_config['type']}")
 
     # Optimizer
     train_config = config['train']
@@ -489,26 +499,54 @@ def main():
     # Save training curves
     plot_training_curves(history, save_path=save_dir / 'training_curves.png')
 
-    # Save sample predictions (use EMA model if available)
-    print("\nSaving sample predictions...")
-    final_model = ema.ema_model if ema is not None else model
-    final_model.eval()
-    with torch.no_grad():
-        images, masks = next(iter(val_loader))
-        images = images.to(device)
-        masks = masks.to(device)
-        predictions = final_model(images)
+    # Load BEST model for final predictions (not the degraded final model)
+    print("\nLoading best model for predictions...")
+    best_path = weights_dir / 'best.pt'
+    if best_path.exists():
+        best_ckpt = torch.load(best_path, map_location=device, weights_only=False)
+        # Create a fresh model for loading best weights (with DS heads to match state_dict)
+        if model_type == 'attention_unet' or model_type == 'attention':
+            best_model = AttentionUNet(**model_kwargs, deep_supervision=deep_supervision).to(device)
+        else:
+            best_model = UNet(**model_kwargs).to(device)
+        best_model.load_state_dict(best_ckpt['model_state_dict'])
+        best_model.eval()  # eval mode returns single output even with DS
+        print(f"Loaded best model from epoch {best_ckpt.get('epoch', '?') + 1}")
+    else:
+        best_model = ema.ema_model if ema is not None else model
+        best_model.eval()
 
+    # Find samples WITH tumors for visualization
+    print("Saving sample predictions...")
+    tumor_images, tumor_masks = [], []
+    with torch.no_grad():
+        for images, masks in val_loader:
+            for i in range(images.size(0)):
+                if masks[i].sum() > 0:  # Has tumor pixels
+                    tumor_images.append(images[i])
+                    tumor_masks.append(masks[i])
+                if len(tumor_images) >= 8:
+                    break
+            if len(tumor_images) >= 8:
+                break
+
+    if len(tumor_images) > 0:
+        tumor_images = torch.stack(tumor_images).to(device)
+        tumor_masks = torch.stack(tumor_masks).to(device)
+        with torch.no_grad():
+            predictions = best_model(tumor_images)
         plot_predictions(
-            images, masks, predictions,
-            num_samples=4,
+            tumor_images, tumor_masks, predictions,
+            num_samples=min(4, len(tumor_images)),
             save_path=save_dir / 'val_predictions.png',
             class_names=['background', 'tumor']
         )
+    else:
+        print("Warning: No tumor samples found in validation set for visualization")
 
     # Final summary
     print(f"\nResults saved to: {save_dir}")
-    print(f"Best model: {weights_dir / 'best.pt'}")
+    print(f"Best model: {best_path}")
 
     best_tumor_dice = max(history['tumor_dice'])
     best_epoch = history['tumor_dice'].index(best_tumor_dice) + 1

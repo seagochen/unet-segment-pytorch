@@ -410,6 +410,44 @@ class BalancedFocalTverskyLoss(nn.Module):
         return self.ce_weight * ce + self.tversky_weight * ft
 
 
+class DeepSupervisionLoss(nn.Module):
+    """
+    Deep Supervision Loss wrapper.
+
+    Computes weighted loss across multiple output scales from the decoder.
+    During training, the model returns [main_output, ds1, ds2, ds3] where
+    ds outputs are at intermediate decoder resolutions (upsampled to full size).
+
+    Args:
+        base_criterion: The base loss function to apply at each scale
+        weights: Weights for [main, ds1, ds2, ds3] outputs
+    """
+
+    def __init__(
+        self,
+        base_criterion: nn.Module,
+        weights: list = None,
+    ):
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.weights = weights or [1.0, 0.4, 0.2, 0.1]
+
+    def forward(
+        self,
+        predictions,
+        targets: torch.Tensor
+    ) -> torch.Tensor:
+        if isinstance(predictions, (list, tuple)):
+            total_loss = 0.0
+            for pred, w in zip(predictions, self.weights):
+                # Auxiliary outputs are already upsampled to full resolution by the model
+                total_loss += w * self.base_criterion(pred, targets)
+            return total_loss
+        else:
+            # Single output (eval mode or no deep supervision)
+            return self.base_criterion(predictions, targets)
+
+
 def create_loss_function(
     loss_type: str = 'combined',
     ce_weight: float = 1.0,

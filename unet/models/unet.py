@@ -8,6 +8,7 @@ Reference:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
 from .layers import DoubleConv, Down, Up, OutConv, AttentionUp
@@ -122,11 +123,16 @@ class AttentionUNet(nn.Module):
         n_classes: Number of output classes
         bilinear: If True, use bilinear upsampling
         base_features: Number of features in the first layer (default: 64)
+        deep_supervision: If True, return auxiliary outputs at intermediate scales
+                          during training for deep supervision loss
 
     Example:
-        >>> model = AttentionUNet(n_channels=1, n_classes=2)
-        >>> x = torch.randn(1, 1, 256, 256)
-        >>> output = model(x)  # shape: (1, 2, 256, 256)
+        >>> model = AttentionUNet(n_channels=1, n_classes=2, deep_supervision=True)
+        >>> x = torch.randn(1, 1, 512, 512)
+        >>> model.train()
+        >>> outputs = model(x)  # list: [main, ds1, ds2, ds3]
+        >>> model.eval()
+        >>> output = model(x)   # single tensor: (1, 2, 512, 512)
     """
 
     def __init__(
@@ -134,12 +140,14 @@ class AttentionUNet(nn.Module):
         n_channels: int = 1,
         n_classes: int = 2,
         bilinear: bool = True,
-        base_features: int = 64
+        base_features: int = 64,
+        deep_supervision: bool = False
     ):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
+        self.deep_supervision = deep_supervision
 
         # Encoder (same as UNet)
         self.inc = DoubleConv(n_channels, base_features)
@@ -159,7 +167,13 @@ class AttentionUNet(nn.Module):
         # Output
         self.outc = OutConv(base_features, n_classes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Deep supervision auxiliary heads
+        if deep_supervision:
+            self.ds_out3 = OutConv(base_features * 8 // factor, n_classes)  # after up1
+            self.ds_out2 = OutConv(base_features * 4 // factor, n_classes)  # after up2
+            self.ds_out1 = OutConv(base_features * 2 // factor, n_classes)  # after up3
+
+    def forward(self, x: torch.Tensor):
         """
         Forward pass.
 
@@ -167,8 +181,11 @@ class AttentionUNet(nn.Module):
             x: Input tensor of shape (N, C, H, W)
 
         Returns:
-            Output logits of shape (N, n_classes, H, W)
+            If deep_supervision and training: list of [main, ds1, ds2, ds3] logits
+            Otherwise: Output logits of shape (N, n_classes, H, W)
         """
+        input_size = x.shape[2:]
+
         # Encoder path
         x1 = self.inc(x)
         x2 = self.down1(x1)
@@ -177,13 +194,21 @@ class AttentionUNet(nn.Module):
         x5 = self.down4(x4)
 
         # Decoder path with attention-weighted skip connections
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
+        d4 = self.up1(x5, x4)
+        d3 = self.up2(d4, x3)
+        d2 = self.up3(d3, x2)
+        d1 = self.up4(d2, x1)
 
-        # Output
-        logits = self.outc(x)
+        # Main output
+        logits = self.outc(d1)
+
+        if self.deep_supervision and self.training:
+            # Auxiliary outputs upsampled to input resolution
+            ds3 = F.interpolate(self.ds_out3(d4), size=input_size, mode='bilinear', align_corners=True)
+            ds2 = F.interpolate(self.ds_out2(d3), size=input_size, mode='bilinear', align_corners=True)
+            ds1 = F.interpolate(self.ds_out1(d2), size=input_size, mode='bilinear', align_corners=True)
+            return [logits, ds1, ds2, ds3]
+
         return logits
 
     def get_num_params(self, trainable_only: bool = True) -> int:

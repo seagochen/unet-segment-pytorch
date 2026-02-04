@@ -26,7 +26,7 @@ from tqdm import tqdm
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from unet.models import UNet
+from unet.models import UNet, AttentionUNet
 from unet.utils.general import get_device
 
 
@@ -57,7 +57,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_model(weights_path: str, device: torch.device) -> UNet:
+def load_model(weights_path: str, device: torch.device) -> torch.nn.Module:
     """
     Load trained model from checkpoint.
 
@@ -74,11 +74,22 @@ def load_model(weights_path: str, device: torch.device) -> UNet:
     config = checkpoint.get('config', {})
     model_config = config.get('model', {})
 
-    model = UNet(
-        n_channels=model_config.get('n_channels', 1),
-        n_classes=model_config.get('n_classes', 2),
-        bilinear=model_config.get('bilinear', True),
-    ).to(device)
+    model_kwargs = {
+        'n_channels': model_config.get('n_channels', 1),
+        'n_classes': model_config.get('n_classes', 2),
+        'bilinear': model_config.get('bilinear', True),
+        'base_features': model_config.get('base_features', 64),
+    }
+
+    model_type = model_config.get('type', 'unet').lower()
+    deep_supervision = model_config.get('deep_supervision', False)
+
+    if model_type in ('attention_unet', 'attention'):
+        model = AttentionUNet(**model_kwargs, deep_supervision=deep_supervision).to(device)
+        print(f"Using Attention U-Net")
+    else:
+        model = UNet(**model_kwargs).to(device)
+        print(f"Using standard U-Net")
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
