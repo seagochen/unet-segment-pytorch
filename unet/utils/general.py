@@ -232,3 +232,94 @@ def colorstr(*args) -> str:
     *style, text = args
     color_codes = ''.join(colors.get(s, '') for s in style)
     return f"{color_codes}{text}{colors['end']}"
+
+
+class ModelEMA:
+    """
+    Exponential Moving Average (EMA) of model parameters.
+
+    Maintains a shadow copy of model parameters that is updated as an
+    exponential moving average of the training model's parameters.
+    This helps stabilize training and often produces better final models.
+
+    Reference:
+        - Mean teachers are better role models (https://arxiv.org/abs/1703.01780)
+
+    Args:
+        model: The model to track
+        decay: EMA decay rate (0.999 is common, closer to 1 = more smoothing)
+        warmup_steps: Number of steps before EMA starts (use 0 to start immediately)
+
+    Example:
+        >>> ema = ModelEMA(model, decay=0.999)
+        >>> for batch in dataloader:
+        ...     loss = criterion(model(x), y)
+        ...     loss.backward()
+        ...     optimizer.step()
+        ...     ema.update(model)  # Update EMA after each step
+        >>> # Use EMA model for validation
+        >>> val_results = validate(ema.ema_model, val_loader)
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        decay: float = 0.999,
+        warmup_steps: int = 0
+    ):
+        self.decay = decay
+        self.warmup_steps = warmup_steps
+        self.updates = 0
+
+        # Create EMA model (deep copy)
+        import copy
+        self.ema_model = copy.deepcopy(model)
+        self.ema_model.eval()
+
+        # Disable gradients for EMA model
+        for param in self.ema_model.parameters():
+            param.requires_grad_(False)
+
+    def update(self, model: torch.nn.Module) -> None:
+        """
+        Update EMA parameters.
+
+        Args:
+            model: The training model with updated parameters
+        """
+        self.updates += 1
+
+        # Compute effective decay (ramp up during warmup)
+        if self.updates <= self.warmup_steps:
+            decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
+        else:
+            decay = self.decay
+
+        # Update EMA parameters
+        with torch.no_grad():
+            model_params = dict(model.named_parameters())
+            for name, ema_param in self.ema_model.named_parameters():
+                if name in model_params:
+                    model_param = model_params[name]
+                    ema_param.data.mul_(decay).add_(model_param.data, alpha=1 - decay)
+
+            # Also update buffers (like BatchNorm running stats)
+            model_buffers = dict(model.named_buffers())
+            for name, ema_buffer in self.ema_model.named_buffers():
+                if name in model_buffers:
+                    model_buffer = model_buffers[name]
+                    ema_buffer.data.copy_(model_buffer.data)
+
+    def state_dict(self) -> dict:
+        """Get EMA state for checkpointing."""
+        return {
+            'ema_state_dict': self.ema_model.state_dict(),
+            'decay': self.decay,
+            'updates': self.updates,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Load EMA state from checkpoint."""
+        self.ema_model.load_state_dict(state_dict['ema_state_dict'])
+        self.decay = state_dict.get('decay', self.decay)
+        self.updates = state_dict.get('updates', 0)

@@ -121,3 +121,135 @@ class OutConv(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
+
+
+class AttentionGate(nn.Module):
+    """
+    Attention Gate for focusing on relevant features.
+
+    Learns to weight skip connection features based on decoder features,
+    helping the model focus on relevant regions (like tumors) while
+    suppressing irrelevant background.
+
+    Reference:
+        Oktay et al., "Attention U-Net: Learning Where to Look for the Pancreas"
+        https://arxiv.org/abs/1804.03999
+
+    Args:
+        gate_channels: Channels from decoder (gating signal)
+        skip_channels: Channels from encoder (skip connection)
+        inter_channels: Intermediate channels for attention computation
+    """
+
+    def __init__(self, gate_channels: int, skip_channels: int, inter_channels: int = None):
+        super().__init__()
+
+        if inter_channels is None:
+            inter_channels = skip_channels // 2
+
+        # Transform gating signal
+        self.W_g = nn.Sequential(
+            nn.Conv2d(gate_channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels)
+        )
+
+        # Transform skip connection
+        self.W_x = nn.Sequential(
+            nn.Conv2d(skip_channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels)
+        )
+
+        # Attention coefficients
+        self.psi = nn.Sequential(
+            nn.Conv2d(inter_channels, 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply attention to skip connection.
+
+        Args:
+            g: Gating signal from decoder (lower resolution)
+            x: Skip connection from encoder (higher resolution)
+
+        Returns:
+            Attention-weighted skip connection
+        """
+        # Upsample gating signal to match skip connection size
+        g_up = F.interpolate(g, size=x.shape[2:], mode='bilinear', align_corners=True)
+
+        # Compute attention
+        g1 = self.W_g(g_up)
+        x1 = self.W_x(x)
+        attention = self.relu(g1 + x1)
+        attention = self.psi(attention)
+
+        # Apply attention to skip connection
+        return x * attention
+
+
+class AttentionUp(nn.Module):
+    """
+    Upsampling block with Attention Gate.
+
+    Applies attention to skip connection before concatenation,
+    helping focus on relevant features.
+
+    Args:
+        in_channels: Total channels after concat (decoder + skip)
+        out_channels: Number of output channels
+        bilinear: If True, use bilinear upsampling
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, bilinear: bool = True):
+        super().__init__()
+
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            # For bilinear: decoder has in_channels // 2, skip has in_channels // 2
+            gate_channels = in_channels // 2  # Decoder input channels
+            skip_channels = in_channels // 2  # Skip connection channels
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            gate_channels = in_channels  # Decoder input before transpose conv
+            skip_channels = in_channels // 2
+            self.conv = DoubleConv(in_channels, out_channels)
+
+        # Attention gate: gating signal from decoder, skip from encoder
+        self.attention = AttentionGate(
+            gate_channels=gate_channels,
+            skip_channels=skip_channels
+        )
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with attention-weighted skip connection.
+
+        Args:
+            x1: Feature map from decoder (to be upsampled)
+            x2: Feature map from encoder (skip connection)
+
+        Returns:
+            Feature map with attention-weighted skip connection
+        """
+        # Apply attention to skip connection BEFORE upsampling x1
+        x2_attended = self.attention(x1, x2)
+
+        # Upsample decoder features
+        x1 = self.up(x1)
+
+        # Handle size mismatch
+        diff_y = x2_attended.size()[2] - x1.size()[2]
+        diff_x = x2_attended.size()[3] - x1.size()[3]
+
+        x1 = F.pad(x1, [diff_x // 2, diff_x - diff_x // 2,
+                       diff_y // 2, diff_y - diff_y // 2])
+
+        # Concatenate and convolve
+        x = torch.cat([x2_attended, x1], dim=1)
+        return self.conv(x)

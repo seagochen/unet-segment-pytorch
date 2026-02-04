@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -26,14 +27,37 @@ from tqdm import tqdm
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from unet.models import UNet
+from unet.models import UNet, AttentionUNet
 from unet.data.dataset import LungTumorDataset
 from unet.data.augmentations import get_train_transforms, get_val_transforms
 from unet.utils.loss import create_loss_function
 from unet.utils.metrics import SegmentationMetrics
-from unet.utils.general import set_seed, get_device, load_config, increment_path
+from unet.utils.general import set_seed, get_device, load_config, increment_path, ModelEMA
 from unet.utils.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from unet.utils.plots import plot_training_curves, plot_predictions
+
+
+def get_warmup_scheduler(optimizer, warmup_epochs, total_epochs, warmup_lr, base_lr):
+    """
+    Create a scheduler with linear warmup followed by cosine annealing.
+
+    Args:
+        optimizer: The optimizer
+        warmup_epochs: Number of warmup epochs
+        total_epochs: Total training epochs
+        warmup_lr: Starting learning rate for warmup
+        base_lr: Target learning rate after warmup
+    """
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            # Linear warmup
+            return warmup_lr / base_lr + (1 - warmup_lr / base_lr) * (epoch / warmup_epochs)
+        else:
+            # Cosine annealing
+            progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+            return 0.5 * (1 + np.cos(np.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def parse_args():
@@ -84,7 +108,8 @@ def train_one_epoch(
     criterion: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    grad_clip: float = 0.0
+    grad_clip: float = 0.0,
+    ema: ModelEMA = None
 ) -> float:
     """
     Train for one epoch.
@@ -113,6 +138,10 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         optimizer.step()
+
+        # Update EMA after each optimizer step
+        if ema is not None:
+            ema.update(model)
 
         total_loss += loss.item()
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
@@ -250,14 +279,34 @@ def main():
     # Model
     print("\nCreating model...")
     model_config = config['model']
-    model = UNet(
-        n_channels=model_config['n_channels'],
-        n_classes=model_config['n_classes'],
-        bilinear=model_config.get('bilinear', True),
-        base_features=model_config.get('base_features', 64),
-    ).to(device)
+    model_type = model_config.get('type', 'unet').lower()
+
+    model_kwargs = {
+        'n_channels': model_config['n_channels'],
+        'n_classes': model_config['n_classes'],
+        'bilinear': model_config.get('bilinear', True),
+        'base_features': model_config.get('base_features', 64),
+    }
+
+    if model_type == 'attention_unet' or model_type == 'attention':
+        model = AttentionUNet(**model_kwargs).to(device)
+        print(f"Using Attention U-Net")
+    else:
+        model = UNet(**model_kwargs).to(device)
+        print(f"Using standard U-Net")
 
     print(f"Model parameters: {model.get_num_params():,}")
+
+    # Create EMA for model stability
+    ema_config = config.get('ema', {})
+    use_ema = ema_config.get('enabled', True)  # Enable by default
+    if use_ema:
+        ema_decay = ema_config.get('decay', 0.99)
+        ema_warmup = ema_config.get('warmup_epochs', 5)
+        ema = ModelEMA(model, decay=ema_decay)
+        print(f"Using EMA with decay={ema_decay}, warmup={ema_warmup} epochs")
+    else:
+        ema = None
 
     # Loss function
     loss_config = config['loss']
@@ -269,7 +318,9 @@ def main():
         focal_gamma=loss_config.get('focal_gamma', 0.75),
         tversky_alpha=loss_config.get('tversky_alpha', 0.7),
         tversky_beta=loss_config.get('tversky_beta', 0.3),
+        balanced_class_weight=loss_config.get('balanced_class_weight', 0.5),
     )
+    print(f"Loss function: {loss_config['type']}")
 
     # Optimizer
     train_config = config['train']
@@ -281,13 +332,31 @@ def main():
 
     # Scheduler
     scheduler_config = config.get('scheduler', {})
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode='max',
-        factor=scheduler_config.get('factor', 0.5),
-        patience=scheduler_config.get('patience', 10),
-        min_lr=scheduler_config.get('min_lr', 1e-6),
-    )
+    scheduler_type = scheduler_config.get('type', 'reduce_on_plateau')
+
+    if scheduler_type == 'warmup_cosine':
+        # Warmup + Cosine Annealing
+        warmup_epochs = scheduler_config.get('warmup_epochs', 5)
+        warmup_lr = scheduler_config.get('warmup_lr', 1e-6)
+        scheduler = get_warmup_scheduler(
+            optimizer,
+            warmup_epochs=warmup_epochs,
+            total_epochs=train_config['epochs'],
+            warmup_lr=warmup_lr,
+            base_lr=train_config['lr'],
+        )
+        use_warmup_scheduler = True
+        print(f"Using warmup+cosine scheduler (warmup: {warmup_epochs} epochs)")
+    else:
+        # ReduceLROnPlateau (default)
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode='max',
+            factor=scheduler_config.get('factor', 0.5),
+            patience=scheduler_config.get('patience', 10),
+            min_lr=scheduler_config.get('min_lr', 1e-6),
+        )
+        use_warmup_scheduler = False
 
     # Callbacks
     early_stop_config = config.get('early_stopping', {})
@@ -296,12 +365,15 @@ def main():
         mode=early_stop_config.get('mode', 'max'),
     ) if early_stop_config.get('enabled', True) else None
 
+    # Use tumor dice for monitoring (not mean dice which rewards all-background)
+    monitor_metric = early_stop_config.get('monitor', 'class_dice.tumor')
     checkpoint = ModelCheckpoint(
         save_dir=weights_dir,
-        monitor=early_stop_config.get('monitor', 'mean_dice'),
+        monitor=monitor_metric,
         mode=early_stop_config.get('mode', 'max'),
         save_last=config['output'].get('save_last', True),
     )
+    print(f"Monitoring metric: {monitor_metric}")
 
     # Metrics
     metrics = SegmentationMetrics(
@@ -328,6 +400,7 @@ def main():
         'val_dice': [],
         'val_iou': [],
         'val_accuracy': [],
+        'tumor_dice': [],  # Track tumor dice specifically
         'lr': [],
     }
 
@@ -344,11 +417,23 @@ def main():
 
         # Train
         train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, grad_clip
+            model, train_loader, criterion, optimizer, device, grad_clip, ema=ema
         )
 
-        # Validate
-        val_results = validate(model, val_loader, criterion, metrics, device)
+        # EMA warmup: use training model for first N epochs, then switch to EMA
+        # This gives EMA time to accumulate meaningful weights
+        ema_warmup_epochs = ema_config.get('warmup_epochs', 5) if ema is not None else 0
+        use_ema_for_val = ema is not None and epoch >= ema_warmup_epochs
+        val_model = ema.ema_model if use_ema_for_val else model
+        val_results = validate(val_model, val_loader, criterion, metrics, device)
+
+        # Print which model is being used for validation
+        if ema is not None and epoch < ema_warmup_epochs:
+            val_model_name = "training model (EMA warmup)"
+        elif ema is not None:
+            val_model_name = "EMA model"
+        else:
+            val_model_name = "training model"
 
         # Update history
         history['train_loss'].append(train_loss)
@@ -356,28 +441,45 @@ def main():
         history['val_dice'].append(val_results['mean_dice'])
         history['val_iou'].append(val_results['mean_iou'])
         history['val_accuracy'].append(val_results['pixel_accuracy'])
+        history['tumor_dice'].append(val_results['class_dice'].get('tumor', 0.0))
         history['lr'].append(current_lr)
 
         # Print results
         print(f"  Train Loss: {train_loss:.4f}")
-        print(f"  Val Loss: {val_results['loss']:.4f} | "
-              f"Dice: {val_results['mean_dice']:.4f} | "
-              f"IoU: {val_results['mean_iou']:.4f} | "
-              f"Acc: {val_results['pixel_accuracy']:.4f}")
+        print(f"  Val [{val_model_name}]: Loss={val_results['loss']:.4f} | "
+              f"Dice={val_results['mean_dice']:.4f} | "
+              f"IoU={val_results['mean_iou']:.4f} | "
+              f"Acc={val_results['pixel_accuracy']:.4f}")
         print(f"  Tumor Dice: {val_results['class_dice'].get('tumor', 0):.4f} | "
               f"Tumor IoU: {val_results['class_iou'].get('tumor', 0):.4f}")
 
-        # Save checkpoint
+        # Save checkpoint (use same model as validation)
+        save_model = ema.ema_model if use_ema_for_val else model
         checkpoint.save(
-            model, optimizer, epoch, val_results,
+            save_model, optimizer, epoch, val_results,
             scheduler=scheduler, config=config
         )
 
+        # Get monitored metric value (supports nested keys like 'class_dice.tumor')
+        def get_metric(results, key):
+            if '.' in key:
+                parts = key.split('.')
+                val = results
+                for p in parts:
+                    val = val.get(p, {}) if isinstance(val, dict) else 0.0
+                return float(val) if not isinstance(val, dict) else 0.0
+            return results.get(key, 0.0)
+
+        monitored_value = get_metric(val_results, monitor_metric)
+
         # Update scheduler
-        scheduler.step(val_results['mean_dice'])
+        if use_warmup_scheduler:
+            scheduler.step()
+        else:
+            scheduler.step(monitored_value)
 
         # Early stopping
-        if early_stopping and early_stopping(val_results['mean_dice']):
+        if early_stopping and early_stopping(monitored_value):
             print("\nEarly stopping triggered!")
             break
 
@@ -387,14 +489,15 @@ def main():
     # Save training curves
     plot_training_curves(history, save_path=save_dir / 'training_curves.png')
 
-    # Save sample predictions
+    # Save sample predictions (use EMA model if available)
     print("\nSaving sample predictions...")
-    model.eval()
+    final_model = ema.ema_model if ema is not None else model
+    final_model.eval()
     with torch.no_grad():
         images, masks = next(iter(val_loader))
         images = images.to(device)
         masks = masks.to(device)
-        predictions = model(images)
+        predictions = final_model(images)
 
         plot_predictions(
             images, masks, predictions,
@@ -407,9 +510,9 @@ def main():
     print(f"\nResults saved to: {save_dir}")
     print(f"Best model: {weights_dir / 'best.pt'}")
 
-    best_dice = max(history['val_dice'])
-    best_epoch = history['val_dice'].index(best_dice) + 1
-    print(f"Best validation Dice: {best_dice:.4f} at epoch {best_epoch}")
+    best_tumor_dice = max(history['tumor_dice'])
+    best_epoch = history['tumor_dice'].index(best_tumor_dice) + 1
+    print(f"Best Tumor Dice: {best_tumor_dice:.4f} at epoch {best_epoch}")
 
 
 if __name__ == '__main__':

@@ -301,6 +301,115 @@ class FocalTverskyLoss(nn.Module):
         return focal_tversky
 
 
+class BalancedCELoss(nn.Module):
+    """
+    Balanced Cross-Entropy Loss with per-image dynamic weighting.
+
+    For each image:
+    - Total weight = 1.0
+    - All tumor pixels share weight = class_weight (default 0.5)
+    - All background pixels share weight = 1 - class_weight (default 0.5)
+
+    This ensures tumor pixels get much higher individual weights when they are few,
+    preventing the model from ignoring them.
+
+    Args:
+        class_weight: Weight for tumor class (0-1), background gets 1-class_weight
+        smooth: Small value to prevent division by zero
+    """
+
+    def __init__(self, class_weight: float = 0.5, smooth: float = 1e-6):
+        super().__init__()
+        self.class_weight = class_weight
+        self.smooth = smooth
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute balanced cross-entropy loss.
+
+        Args:
+            predictions: Model output logits (N, C, H, W)
+            targets: Ground truth labels (N, H, W)
+
+        Returns:
+            Balanced CE loss value
+        """
+        N, C, H, W = predictions.shape
+        total_pixels = H * W
+
+        # Compute per-pixel cross entropy (no reduction)
+        ce_loss = F.cross_entropy(predictions, targets, reduction='none')  # (N, H, W)
+
+        # Create per-pixel weights
+        weights = torch.zeros_like(ce_loss)
+
+        for i in range(N):
+            target_i = targets[i]
+            tumor_mask = (target_i == 1)
+            bg_mask = (target_i == 0)
+
+            num_tumor = tumor_mask.sum().float() + self.smooth
+            num_bg = bg_mask.sum().float() + self.smooth
+
+            # Weight per tumor pixel = class_weight / num_tumor_pixels
+            # Weight per bg pixel = (1 - class_weight) / num_bg_pixels
+            weights[i][tumor_mask] = self.class_weight / num_tumor
+            weights[i][bg_mask] = (1 - self.class_weight) / num_bg
+
+        # Weighted loss
+        weighted_loss = (ce_loss * weights).sum() / N
+
+        return weighted_loss
+
+
+class BalancedFocalTverskyLoss(nn.Module):
+    """
+    Combined Balanced CE + Focal Tversky Loss.
+
+    Combines:
+    1. Balanced CE: Ensures equal attention to tumor vs background
+    2. Focal Tversky: Focuses on hard examples and penalizes false negatives
+
+    Args:
+        ce_weight: Weight for balanced CE component
+        tversky_weight: Weight for Focal Tversky component
+        class_weight: Tumor class weight for balanced CE (default 0.5)
+        alpha: Tversky alpha (weight for false negatives)
+        beta: Tversky beta (weight for false positives)
+        gamma: Focal parameter
+    """
+
+    def __init__(
+        self,
+        ce_weight: float = 1.0,
+        tversky_weight: float = 1.0,
+        class_weight: float = 0.5,
+        alpha: float = 0.7,
+        beta: float = 0.3,
+        gamma: float = 0.75,
+    ):
+        super().__init__()
+        self.ce_weight = ce_weight
+        self.tversky_weight = tversky_weight
+
+        self.balanced_ce = BalancedCELoss(class_weight=class_weight)
+        self.focal_tversky = FocalTverskyLoss(alpha=alpha, beta=beta, gamma=gamma)
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor
+    ) -> torch.Tensor:
+        ce = self.balanced_ce(predictions, targets)
+        ft = self.focal_tversky(predictions, targets)
+
+        return self.ce_weight * ce + self.tversky_weight * ft
+
+
 def create_loss_function(
     loss_type: str = 'combined',
     ce_weight: float = 1.0,
@@ -309,18 +418,21 @@ def create_loss_function(
     focal_gamma: float = 2.0,
     tversky_alpha: float = 0.7,
     tversky_beta: float = 0.3,
+    balanced_class_weight: float = 0.5,
 ) -> nn.Module:
     """
     Factory function to create loss function.
 
     Args:
-        loss_type: One of 'dice', 'ce', 'combined', 'focal', 'focal_tversky'
+        loss_type: One of 'dice', 'ce', 'combined', 'focal', 'focal_tversky',
+                   'balanced_ce', 'balanced_focal_tversky'
         ce_weight: Weight for CE in combined loss
         dice_weight: Weight for Dice in combined loss
         class_weights: Optional class weights
         focal_gamma: Gamma for focal loss / focal tversky loss
         tversky_alpha: Alpha for Focal Tversky (weight for false negatives)
         tversky_beta: Beta for Focal Tversky (weight for false positives)
+        balanced_class_weight: Tumor class weight for balanced losses (default 0.5)
 
     Returns:
         Loss function module
@@ -347,6 +459,17 @@ def create_loss_function(
             alpha=tversky_alpha,
             beta=tversky_beta,
             gamma=focal_gamma
+        )
+    elif loss_type == 'balanced_ce':
+        return BalancedCELoss(class_weight=balanced_class_weight)
+    elif loss_type == 'balanced_focal_tversky':
+        return BalancedFocalTverskyLoss(
+            ce_weight=ce_weight,
+            tversky_weight=dice_weight,  # Reuse dice_weight for tversky_weight
+            class_weight=balanced_class_weight,
+            alpha=tversky_alpha,
+            beta=tversky_beta,
+            gamma=focal_gamma,
         )
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")

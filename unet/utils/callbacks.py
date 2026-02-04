@@ -133,6 +133,28 @@ class ModelCheckpoint:
         else:  # mode == 'max'
             self.is_better = lambda a, b: a > b
 
+    def _get_metric(self, metrics: dict, key: str) -> float:
+        """
+        Get metric value, supporting nested keys like 'class_dice.tumor'.
+
+        Args:
+            metrics: Dictionary of metrics
+            key: Metric key (can be nested with '.')
+
+        Returns:
+            Metric value or 0.0 if not found
+        """
+        if '.' in key:
+            parts = key.split('.')
+            value = metrics
+            for part in parts:
+                if isinstance(value, dict):
+                    value = value.get(part, {})
+                else:
+                    return 0.0
+            return float(value) if not isinstance(value, dict) else 0.0
+        return metrics.get(key, 0.0)
+
     def save(
         self,
         model: torch.nn.Module,
@@ -156,8 +178,8 @@ class ModelCheckpoint:
         Returns:
             True if best model was updated, False otherwise
         """
-        # Get current score
-        current_score = metrics.get(self.monitor, metrics.get('mean_dice', 0.0))
+        # Get current score (supports nested keys like 'class_dice.tumor')
+        current_score = self._get_metric(metrics, self.monitor)
 
         # Create checkpoint dict
         checkpoint = {
