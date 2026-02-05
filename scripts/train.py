@@ -109,42 +109,56 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     grad_clip: float = 0.0,
-    ema: ModelEMA = None
+    ema: ModelEMA = None,
+    accumulation_steps: int = 1
 ) -> float:
     """
-    Train for one epoch.
+    Train for one epoch with optional gradient accumulation.
+
+    Gradient accumulation simulates larger batch sizes without extra VRAM.
+    For example, batch_size=4 with accumulation_steps=4 = effective batch 16.
 
     Returns:
         Average loss for the epoch
     """
     model.train()
     total_loss = 0.0
+    optimizer.zero_grad()
 
     pbar = tqdm(dataloader, desc='Training', leave=False)
-    for images, masks in pbar:
+    for i, (images, masks) in enumerate(pbar):
         images = images.to(device)
         masks = masks.to(device)
 
         # Forward pass
-        optimizer.zero_grad()
         outputs = model(images)
-        loss = criterion(outputs, masks)
+        loss = criterion(outputs, masks) / accumulation_steps
 
-        # Backward pass
+        # Backward pass (accumulate gradients)
         loss.backward()
 
-        # Gradient clipping
+        # Step optimizer every accumulation_steps
+        if (i + 1) % accumulation_steps == 0:
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Update EMA after each actual optimizer step
+            if ema is not None:
+                ema.update(model)
+
+        total_loss += loss.item() * accumulation_steps
+        pbar.set_postfix({'loss': f'{loss.item() * accumulation_steps:.4f}'})
+
+    # Handle remaining gradients if dataloader length is not divisible
+    if len(dataloader) % accumulation_steps != 0:
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
         optimizer.step()
-
-        # Update EMA after each optimizer step
+        optimizer.zero_grad()
         if ema is not None:
             ema.update(model)
-
-        total_loss += loss.item()
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
     return total_loss / len(dataloader)
 
@@ -420,6 +434,10 @@ def main():
 
     num_epochs = train_config['epochs']
     grad_clip = train_config.get('grad_clip', 0.0)
+    accumulation_steps = train_config.get('accumulation_steps', 1)
+    effective_batch = data_config['batch_size'] * accumulation_steps
+    if accumulation_steps > 1:
+        print(f"Gradient accumulation: {accumulation_steps} steps (effective batch={effective_batch})")
 
     for epoch in range(start_epoch, num_epochs):
         current_lr = optimizer.param_groups[0]['lr']
@@ -427,7 +445,8 @@ def main():
 
         # Train
         train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, grad_clip, ema=ema
+            model, train_loader, criterion, optimizer, device, grad_clip,
+            ema=ema, accumulation_steps=accumulation_steps
         )
 
         # EMA warmup: use training model for first N epochs, then switch to EMA

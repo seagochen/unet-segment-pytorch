@@ -20,15 +20,16 @@ data:
 
 # Training Configuration
 train:
-  epochs: 150
+  epochs: 400            # Increased for gradient accumulation (8x fewer steps/epoch)
   lr: 0.00005            # Very low constant learning rate
   weight_decay: 0.001    # Stronger L2 regularization
   grad_clip: 1.0         # Gradient clipping (0 to disable)
+  accumulation_steps: 8  # Gradient accumulation (effective batch = 4 x 8 = 32)
 
 # Learning Rate Scheduler
 scheduler:
   type: reduce_on_plateau  # Use plateau-based reduction instead of warmup
-  patience: 15             # Wait longer before reducing
+  patience: 30             # More patience (fewer steps per epoch with grad accum)
   factor: 0.5              # LR reduction factor
   min_lr: 0.000001
 
@@ -41,7 +42,7 @@ ema:
 # Early Stopping
 early_stopping:
   enabled: true          # Re-enable early stopping
-  patience: 25           # Slightly more patience for higher resolution
+  patience: 50           # More patience for grad accum (fewer updates per epoch)
   monitor: class_dice.tumor  # Monitor TUMOR dice, not mean dice!
   mode: max              # 'max' for metrics, 'min' for loss
 
