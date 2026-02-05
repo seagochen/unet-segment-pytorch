@@ -358,7 +358,17 @@ def main():
     scheduler_config = config.get('scheduler', {})
     scheduler_type = scheduler_config.get('type', 'reduce_on_plateau')
 
-    if scheduler_type == 'warmup_cosine':
+    if scheduler_type == 'cosine_annealing':
+        # Cosine Annealing (smooth LR decay, reduces val oscillation)
+        min_lr = scheduler_config.get('min_lr', 1e-6)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=train_config['epochs'],
+            eta_min=min_lr,
+        )
+        use_warmup_scheduler = True  # step per epoch, not per metric
+        print(f"Using cosine annealing scheduler (T_max={train_config['epochs']}, min_lr={min_lr})")
+    elif scheduler_type == 'warmup_cosine':
         # Warmup + Cosine Annealing
         warmup_epochs = scheduler_config.get('warmup_epochs', 5)
         warmup_lr = scheduler_config.get('warmup_lr', 1e-6)

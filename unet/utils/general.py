@@ -31,9 +31,9 @@ def set_seed(seed: int = 42) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        # For deterministic behavior (may impact performance)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        # benchmark=True is faster for fixed-size inputs (e.g. 512x512)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 
 def get_device(device: str = '') -> torch.device:

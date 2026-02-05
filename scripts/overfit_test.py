@@ -22,9 +22,9 @@ from torch.utils.data import DataLoader, Subset
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from unet.models import UNet
+from unet.models import UNet, AttentionUNet
 from unet.data.dataset import LungTumorDataset
-from unet.utils.loss import FocalTverskyLoss, DiceLoss
+from unet.utils.loss import FocalTverskyLoss, DiceLoss, BalancedFocalTverskyLoss, DeepSupervisionLoss
 
 
 def visualize_samples(dataset, indices, save_path="overfit_samples.png"):
@@ -70,6 +70,8 @@ def overfit_test(
     num_epochs: int = 200,
     lr: float = 0.001,
     loss_type: str = "focal_tversky",
+    model_type: str = "unet",
+    img_size: int = 256,
 ):
     """
     过拟合测试
@@ -79,7 +81,9 @@ def overfit_test(
         num_samples: 使用的样本数量
         num_epochs: 训练轮数
         lr: 学习率
-        loss_type: 损失函数类型 ('focal_tversky', 'dice', 'ce')
+        loss_type: 损失函数类型 ('focal_tversky', 'dice', 'ce', 'balanced_focal_tversky')
+        model_type: 模型类型 ('unet', 'attention_unet')
+        img_size: 输入图像尺寸
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -90,7 +94,7 @@ def overfit_test(
         root=data_root,
         split='train',
         transform=None,
-        img_size=256
+        img_size=img_size
     )
 
     # 找出有肿瘤的样本
@@ -124,17 +128,34 @@ def overfit_test(
     dataloader = DataLoader(small_dataset, batch_size=num_samples, shuffle=True)
 
     # 创建模型
-    model = UNet(n_channels=1, n_classes=2, bilinear=True).to(device)
+    use_deep_supervision = (model_type == 'attention_unet')
+    if model_type == 'attention_unet':
+        model = AttentionUNet(n_channels=1, n_classes=2, bilinear=True, deep_supervision=True).to(device)
+        print(f"使用 AttentionUNet + Deep Supervision")
+    else:
+        model = UNet(n_channels=1, n_classes=2, bilinear=True).to(device)
+        print(f"使用 UNet")
 
     # 创建损失函数
-    if loss_type == 'focal_tversky':
-        criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
+    if loss_type == 'balanced_focal_tversky':
+        base_criterion = BalancedFocalTverskyLoss(
+            ce_weight=1.0, tversky_weight=1.0,
+            class_weight=0.5, alpha=0.7, beta=0.3, gamma=0.75
+        )
+    elif loss_type == 'focal_tversky':
+        base_criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
     elif loss_type == 'dice':
-        criterion = DiceLoss(ignore_background=True)
+        base_criterion = DiceLoss(ignore_background=True)
     else:
-        criterion = torch.nn.CrossEntropyLoss()
+        base_criterion = torch.nn.CrossEntropyLoss()
 
-    print(f"\n损失函数: {loss_type}")
+    # 如果使用深监督，包装损失函数
+    if use_deep_supervision:
+        criterion = DeepSupervisionLoss(base_criterion, weights=[1.0, 0.4, 0.2, 0.1])
+        print(f"损失函数: {loss_type} + DeepSupervision")
+    else:
+        criterion = base_criterion
+        print(f"损失函数: {loss_type}")
 
     # 优化器
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -170,6 +191,9 @@ def overfit_test(
                 masks = masks.to(device)
 
                 outputs = model(images)
+                # eval mode returns single tensor even with deep supervision
+                if isinstance(outputs, (list, tuple)):
+                    outputs = outputs[0]
                 probs = F.softmax(outputs, dim=1)
                 preds = probs.argmax(dim=1)
 
@@ -205,6 +229,8 @@ def overfit_test(
         images, masks = next(iter(dataloader))
         images = images.to(device)
         outputs = model(images)
+        if isinstance(outputs, (list, tuple)):
+            outputs = outputs[0]
         probs = F.softmax(outputs, dim=1)
         preds = probs.argmax(dim=1).cpu()
 
@@ -289,8 +315,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=0.001,
                         help="学习率")
     parser.add_argument("--loss", type=str, default="focal_tversky",
-                        choices=["focal_tversky", "dice", "ce"],
+                        choices=["focal_tversky", "dice", "ce", "balanced_focal_tversky"],
                         help="损失函数类型")
+    parser.add_argument("--model", type=str, default="unet",
+                        choices=["unet", "attention_unet"],
+                        help="模型类型")
+    parser.add_argument("--img-size", type=int, default=256,
+                        help="输入图像尺寸")
 
     args = parser.parse_args()
 
@@ -299,5 +330,7 @@ if __name__ == "__main__":
         num_samples=args.samples,
         num_epochs=args.epochs,
         lr=args.lr,
-        loss_type=args.loss
+        loss_type=args.loss,
+        model_type=args.model,
+        img_size=args.img_size,
     )
