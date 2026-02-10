@@ -8,7 +8,7 @@ model:
   n_classes: 2           # Background + Tumor
   bilinear: true         # Use bilinear upsampling (vs transposed conv)
   base_features: 64      # Base number of features
-  deep_supervision: true # Compute loss at multiple decoder scales
+  deep_supervision: false # Stage 3: disabled to remove conflicting gradients
 
 # Data Configuration
 data:
@@ -20,42 +20,37 @@ data:
 
 # Training Configuration
 train:
-  epochs: 200            # Stage 2: extended training with cosine LR
-  lr: 0.0001             # Stage 1: raised from 5e-5 to 1e-4
+  epochs: 150            # Stage 4: same budget
+  lr: 0.00005            # Stage 4: target lr after warmup
   weight_decay: 0.0001   # Stage 1: lowered from 1e-3 to 1e-4
   grad_clip: 1.0         # Gradient clipping (0 to disable)
   accumulation_steps: 8  # Gradient accumulation (effective batch = 4 x 8 = 32)
 
 # Learning Rate Scheduler
 scheduler:
-  type: cosine_annealing   # Smooth LR decay to reduce val oscillation
+  type: warmup_cosine      # Stage 4: linear warmup then cosine decay
+  warmup_epochs: 10        # First 10 epochs: lr ramps 0 → 5e-5 (avoid early oscillation)
   min_lr: 0.000001
 
-# EMA (Exponential Moving Average) - Stabilizes training
+# EMA (Exponential Moving Average)
 ema:
-  enabled: true            # Stage 2: re-enabled, model is stable enough
-  decay: 0.99
-  warmup_epochs: 50        # Wait for model to converge before EMA kicks in
+  enabled: true            # Stage 4: re-enabled (training is now stable with DiceBCE)
+  decay: 0.999             # High decay for smooth averaging
+  warmup_epochs: 10        # First 10 epochs: validate with training model (align with LR warmup)
 
 # Early Stopping
 early_stopping:
-  enabled: true          # Re-enable early stopping
-  patience: 50           # More patience for grad accum (fewer updates per epoch)
-  monitor: class_dice.tumor  # Monitor TUMOR dice, not mean dice!
-  mode: max              # 'max' for metrics, 'min' for loss
+  enabled: true
+  patience: 30             # Stage 4: 30 epochs (was 50)
+  monitor: class_dice.tumor
+  mode: max
 
 # Loss Function
 loss:
-  type: balanced_focal_tversky  # Balanced CE + Focal Tversky
-  balanced_class_weight: 0.5    # Weight for tumor class (0.5 = equal attention)
-  ce_weight: 1.0                # Weight for balanced CE component
-  dice_weight: 1.0              # Weight for Focal Tversky component
-  # Focal Tversky parameters
-  tversky_alpha: 0.7            # Weight for false negatives
-  tversky_beta: 0.3             # Weight for false positives
-  focal_gamma: 0.75             # Focus on hard examples
-  # Deep supervision loss weights: [main, 1/2_res, 1/4_res, 1/8_res]
-  ds_weights: [1.0, 0.3, 0.1, 0.0]  # Disable noisy 1/8 res layer
+  type: dice_bce              # Stage 3: BalancedCE + Dice (stable, smooth gradients)
+  balanced_class_weight: 0.5  # Weight for tumor class (0.5 = equal attention)
+  ce_weight: 1.0              # Weight for balanced CE component
+  dice_weight: 1.0            # Weight for Dice component
 
 # Data Augmentation
 augmentation:

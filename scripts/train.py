@@ -16,8 +16,6 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
-from datetime import datetime
-
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -331,9 +329,6 @@ def main():
         ce_weight=loss_config.get('ce_weight', 1.0),
         dice_weight=loss_config.get('dice_weight', 1.0),
         class_weights=loss_config.get('class_weights'),
-        focal_gamma=loss_config.get('focal_gamma', 0.75),
-        tversky_alpha=loss_config.get('tversky_alpha', 0.7),
-        tversky_beta=loss_config.get('tversky_beta', 0.3),
         balanced_class_weight=loss_config.get('balanced_class_weight', 0.5),
     )
 
@@ -463,6 +458,14 @@ def main():
         # This gives EMA time to accumulate meaningful weights
         ema_warmup_epochs = ema_config.get('warmup_epochs', 5) if ema is not None else 0
         use_ema_for_val = ema is not None and epoch >= ema_warmup_epochs
+
+        # At the transition point, re-initialize EMA from the current training model.
+        # Without this, EMA still carries ~50% random init weights (0.999^720 ≈ 0.49)
+        if ema is not None and epoch == ema_warmup_epochs:
+            ema.ema_model.load_state_dict(model.state_dict())
+            ema.updates = 0
+            print(f"  EMA re-initialized from training model at epoch {epoch + 1}")
+
         val_model = ema.ema_model if use_ema_for_val else model
         val_results = validate(val_model, val_loader, criterion, metrics, device)
 

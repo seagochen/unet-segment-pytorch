@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from unet.models import UNet, AttentionUNet
 from unet.data.dataset import LungTumorDataset
-from unet.utils.loss import FocalTverskyLoss, DiceLoss, BalancedFocalTverskyLoss, DeepSupervisionLoss
+from unet.utils.loss import DiceLoss, DiceBCELoss, DeepSupervisionLoss
 
 
 def visualize_samples(dataset, indices, save_path="overfit_samples.png"):
@@ -69,7 +69,7 @@ def overfit_test(
     num_samples: int = 4,
     num_epochs: int = 200,
     lr: float = 0.001,
-    loss_type: str = "focal_tversky",
+    loss_type: str = "dice_bce",
     model_type: str = "unet",
     img_size: int = 256,
 ):
@@ -137,13 +137,8 @@ def overfit_test(
         print(f"使用 UNet")
 
     # 创建损失函数
-    if loss_type == 'balanced_focal_tversky':
-        base_criterion = BalancedFocalTverskyLoss(
-            ce_weight=1.0, tversky_weight=1.0,
-            class_weight=0.5, alpha=0.7, beta=0.3, gamma=0.75
-        )
-    elif loss_type == 'focal_tversky':
-        base_criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
+    if loss_type == 'dice_bce':
+        base_criterion = DiceBCELoss()
     elif loss_type == 'dice':
         base_criterion = DiceLoss(ignore_background=True)
     else:
@@ -314,8 +309,8 @@ if __name__ == "__main__":
                         help="训练轮数")
     parser.add_argument("--lr", type=float, default=0.001,
                         help="学习率")
-    parser.add_argument("--loss", type=str, default="focal_tversky",
-                        choices=["focal_tversky", "dice", "ce", "balanced_focal_tversky"],
+    parser.add_argument("--loss", type=str, default="dice_bce",
+                        choices=["dice_bce", "dice", "ce"],
                         help="损失函数类型")
     parser.add_argument("--model", type=str, default="unet",
                         choices=["unet", "attention_unet"],

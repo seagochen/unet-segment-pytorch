@@ -9,7 +9,6 @@ Reference:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 from .layers import DoubleConv, Down, Up, OutConv, AttentionUp
 
@@ -216,33 +215,3 @@ class AttentionUNet(nn.Module):
         if trainable_only:
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
         return sum(p.numel() for p in self.parameters())
-
-
-def create_unet(
-    n_channels: int = 1,
-    n_classes: int = 2,
-    bilinear: bool = True,
-    pretrained: Optional[str] = None
-) -> UNet:
-    """
-    Factory function to create UNet model.
-
-    Args:
-        n_channels: Number of input channels
-        n_classes: Number of output classes
-        bilinear: Whether to use bilinear upsampling
-        pretrained: Path to pretrained weights (optional)
-
-    Returns:
-        UNet model instance
-    """
-    model = UNet(n_channels=n_channels, n_classes=n_classes, bilinear=bilinear)
-
-    if pretrained is not None:
-        checkpoint = torch.load(pretrained, map_location='cpu', weights_only=False)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-
-    return model
