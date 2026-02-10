@@ -34,9 +34,7 @@ scheduler:
 
 # EMA (Exponential Moving Average)
 ema:
-  enabled: true            # Stage 4: re-enabled (training is now stable with DiceBCE)
-  decay: 0.999             # High decay for smooth averaging
-  warmup_epochs: 10        # First 10 epochs: validate with training model (align with LR warmup)
+  enabled: false           # Stage 4: disabled (EMA causes tumor dice collapse at all decay rates)
 
 # Early Stopping
 early_stopping:
