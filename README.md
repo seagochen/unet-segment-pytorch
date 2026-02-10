@@ -1,6 +1,8 @@
 # UNet Lung Tumor Segmentation (PyTorch)
 
-A PyTorch implementation of **Attention U-Net** with **Deep Supervision** for lung tumor segmentation on CT images.
+A PyTorch implementation of **Attention U-Net** for lung tumor segmentation on CT images.
+
+**Best Result: Tumor Dice 0.8080** (AttentionUNet + DiceBCE loss + Cosine Annealing)
 
 ## Architecture
 
@@ -9,22 +11,21 @@ Input (1, 512, 512)
     |
 [Encoder]                          [Decoder]
 DoubleConv ─── 64 ──── AG ──── AttentionUp ── 64 ─── OutConv(n_classes)
-    |                                  |                     |
-  Down ────── 128 ──── AG ──── AttentionUp ─ 128    DS Head (1/2 res)
-    |                                  |                     |
-  Down ────── 256 ──── AG ──── AttentionUp ─ 256    DS Head (1/4 res)
-    |                                  |                     |
-  Down ────── 512 ──── AG ──── AttentionUp ─ 512    DS Head (1/8 res)
+    |                                  |
+  Down ────── 128 ──── AG ──── AttentionUp ─ 128
+    |                                  |
+  Down ────── 256 ──── AG ──── AttentionUp ─ 256
+    |                                  |
+  Down ────── 512 ──── AG ──── AttentionUp ─ 512
     |                                  |
   Down ──── Bottleneck (512) ──────────┘
 ```
 
 Key features:
 - **Attention Gates** on skip connections for focusing on small tumors
-- **Deep Supervision** with auxiliary loss at 3 intermediate decoder scales
-- **Balanced Focal Tversky Loss** to handle extreme class imbalance (~0.36% tumor pixels)
-- **EMA (Exponential Moving Average)** for training stability
+- **DiceBCE Loss** (Balanced CE + Dice) for stable training with extreme class imbalance
 - **Gradient Accumulation** for large effective batch sizes on limited VRAM
+- **Cosine Annealing LR** for smooth convergence
 
 ## Project Structure
 
@@ -36,18 +37,19 @@ unet-segment-pytorch/
 │   │   └── unet.py                 # UNet, AttentionUNet
 │   ├── data/
 │   │   ├── dataset.py              # LungTumorDataset (volume-based split)
-│   │   └── augmentations.py        # Albumentations pipelines
+│   │   └── augmentations.py        # Albumentations 2.0 pipelines
 │   └── utils/
-│       ├── loss.py                 # DiceLoss, FocalTverskyLoss, BalancedFocalTverskyLoss, DeepSupervisionLoss
+│       ├── loss.py                 # DiceLoss, BalancedCELoss, DiceBCELoss, DeepSupervisionLoss
 │       ├── metrics.py              # SegmentationMetrics (IoU, Dice, PixelAccuracy)
-│       ├── general.py              # Seeds, device, checkpoint, ModelEMA
-│       ├── callbacks.py            # EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+│       ├── general.py              # Seeds, device, config, ModelEMA
+│       ├── callbacks.py            # EarlyStopping, ModelCheckpoint
 │       └── plots.py                # Training curves, prediction visualization
 ├── configs/
 │   └── lung_tumor.yaml             # Training configuration
 ├── scripts/
-│   ├── train.py                    # Training with gradient accumulation + deep supervision
-│   └── predict.py                  # Inference (single image or directory)
+│   ├── train.py                    # Training with gradient accumulation
+│   ├── predict.py                  # Inference (single image or directory)
+│   └── overfit_test.py             # Sanity check on small sample set
 ├── toolkits/
 │   ├── download_medical_segmentation.py   # Download dataset from Kaggle
 │   └── convert_medical_segmentation.py    # Convert NIfTI to PNG slices
@@ -99,19 +101,19 @@ Training outputs are saved to `runs/<experiment_name>/`:
 - `weights/best.pt` - Best model (by Tumor Dice)
 - `weights/last.pt` - Last checkpoint
 - `training_curves.png` - Loss and metric plots
-- `predictions.png` - Sample predictions
+- `val_predictions.png` - Sample predictions
 
 Key training parameters (see `configs/lung_tumor.yaml`):
 
 | Parameter | Value | Note |
 |-----------|-------|------|
-| Model | Attention U-Net | With deep supervision |
+| Model | Attention U-Net | Without deep supervision |
 | Input size | 512x512 | Grayscale CT |
 | Batch size | 4 | Effective 32 via gradient accumulation |
-| Optimizer | AdamW | lr=5e-5, weight_decay=1e-3 |
-| Loss | Balanced Focal Tversky | CE + Focal Tversky, alpha=0.7/beta=0.3 |
-| EMA decay | 0.99 | 10-epoch warmup |
-| Early stopping | patience=50 | Monitors Tumor Dice |
+| Optimizer | AdamW | lr=5e-5, weight_decay=1e-4 |
+| Loss | DiceBCE | Balanced CE + Dice, stable for small targets |
+| Scheduler | Cosine Annealing | min_lr=1e-6 |
+| Early stopping | patience=30 | Monitors Tumor Dice |
 
 ### Inference
 
@@ -129,28 +131,41 @@ python scripts/predict.py --weights best.pt --source image.png --threshold 0.3
 ## Data Handling
 
 - **Volume-based split**: Train/val split by volume ID, not individual slices, to prevent data leakage
-- **Augmentation** (training only): HorizontalFlip, VerticalFlip, ShiftScaleRotate, ElasticTransform, GridDistortion, BrightnessContrast, GaussNoise, CoarseDropout
-- **Class imbalance**: Tumor pixels are ~0.36% of each image. Addressed via balanced per-pixel CE weighting + Focal Tversky loss
+- **Augmentation** (training only): HorizontalFlip, Affine, ElasticTransform, GridDistortion, BrightnessContrast, GaussNoise, CoarseDropout
+- **Class imbalance**: Tumor pixels are ~0.36% of each image. Addressed via balanced per-pixel CE weighting in DiceBCE loss
 
 ## Loss Functions
 
 | Loss | Description |
 |------|-------------|
+| `dice_bce` | Balanced CE + Dice (recommended, most stable) |
 | `dice` | Dice Loss (foreground only) |
 | `ce` | Cross-Entropy |
-| `combined` | CE + Dice |
-| `focal` | Focal Loss |
-| `focal_tversky` | Focal Tversky (alpha/beta control FN/FP trade-off) |
 | `balanced_ce` | Per-pixel balanced CE (dynamic weighting by class area) |
-| `balanced_focal_tversky` | Balanced CE + Focal Tversky (default) |
 
 Configure in `configs/lung_tumor.yaml` via `loss.type`.
+
+## Training Optimization History
+
+This project went through 4 stages of optimization:
+
+| Stage | Best Tumor Dice | Key Change |
+|-------|----------------|------------|
+| 1 | 0.7480 | Fix EMA/augmentation/lr issues |
+| 2 | 0.7815 | Cosine LR (but FocalTversky caused instability) |
+| 3 | **0.8080** | **DiceBCE loss — stable, no catastrophic drops** |
+| 4 | 0.7968 | LR warmup (no improvement over Stage 3) |
+
+Key lessons:
+- **DiceBCE** is the most stable loss for small-target segmentation
+- **EMA** causes tumor dice collapse for this task (fragile decision boundary)
+- **Deep Supervision** adds noise for small targets (low-res heads can't represent small tumors)
+- **Val oscillation is inherent**: Tumor Dice swings 0.1-0.2 between epochs due to tiny tumor size
 
 ## References
 
 - [U-Net: Convolutional Networks for Biomedical Image Segmentation](https://arxiv.org/abs/1505.04597) (Ronneberger et al., 2015)
 - [Attention U-Net: Learning Where to Look for the Pancreas](https://arxiv.org/abs/1804.03999) (Oktay et al., 2018)
-- [A Novel Focal Tversky Loss with Improved Attention U-Net for Lesion Segmentation](https://arxiv.org/abs/1810.07842) (Abraham & Khan, 2019)
 
 ## License
 

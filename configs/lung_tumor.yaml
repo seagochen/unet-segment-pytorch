@@ -8,44 +8,44 @@ model:
   n_classes: 2           # Background + Tumor
   bilinear: true         # Use bilinear upsampling (vs transposed conv)
   base_features: 64      # Base number of features
-  deep_supervision: false # Stage 3: disabled to remove conflicting gradients
+  deep_supervision: false # Disabled (low-res heads hurt small tumor detection)
 
 # Data Configuration
 data:
   root: ./dataset
-  img_size: 512          # Higher resolution for small tumor detection (was 256)
+  img_size: 512          # Higher resolution for small tumor detection
   val_ratio: 0.2         # 20% for validation
-  batch_size: 4          # Reduced for 512 input (was 8)
+  batch_size: 4          # Effective 32 via gradient accumulation
   num_workers: 4
 
 # Training Configuration
 train:
-  epochs: 150            # Stage 4: same budget
-  lr: 0.00005            # Stage 4: target lr after warmup
-  weight_decay: 0.0001   # Stage 1: lowered from 1e-3 to 1e-4
+  epochs: 150
+  lr: 0.00005            # 5e-5, target lr (after warmup if using warmup_cosine)
+  weight_decay: 0.0001
   grad_clip: 1.0         # Gradient clipping (0 to disable)
   accumulation_steps: 8  # Gradient accumulation (effective batch = 4 x 8 = 32)
 
 # Learning Rate Scheduler
 scheduler:
-  type: warmup_cosine      # Stage 4: linear warmup then cosine decay
-  warmup_epochs: 10        # First 10 epochs: lr ramps 0 → 5e-5 (avoid early oscillation)
+  type: warmup_cosine      # Options: cosine_annealing, warmup_cosine, reduce_on_plateau
+  warmup_epochs: 10        # Linear warmup from ~0 to lr (warmup_cosine only)
   min_lr: 0.000001
 
 # EMA (Exponential Moving Average)
 ema:
-  enabled: false           # Stage 4: disabled (EMA causes tumor dice collapse at all decay rates)
+  enabled: false           # Disabled (causes tumor dice collapse for small-target tasks)
 
 # Early Stopping
 early_stopping:
   enabled: true
-  patience: 30             # Stage 4: 30 epochs (was 50)
+  patience: 30
   monitor: class_dice.tumor
   mode: max
 
 # Loss Function
 loss:
-  type: dice_bce              # Stage 3: BalancedCE + Dice (stable, smooth gradients)
+  type: dice_bce              # BalancedCE + Dice (most stable for small targets)
   balanced_class_weight: 0.5  # Weight for tumor class (0.5 = equal attention)
   ce_weight: 1.0              # Weight for balanced CE component
   dice_weight: 1.0            # Weight for Dice component
